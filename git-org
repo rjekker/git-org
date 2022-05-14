@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+
+# Git Pisces
+# Automatically sync a git repo.
+# For info see https://github.com/rjekker/git-org
+
+# Reindert-Jan Ekker, 2022
+
+#### Constants ####
+declare -r TIMEOUT=600  # How long to wait for changes before we fetch/pull
+declare -r MAX_NEW=10  # How many new files do we auto-commit?
+declare -r MAX_NEW_SIZE=1000  # What is the max file size of new files to auto-commit (in kilobytes)?
+declare SLEEP_BEFORE_COMMIT=60 # When dirty: how long to wait before commit, when a change is detected..
+
+# shellcheck disable=SC2155
+declare -r SYSTEM="$(uname)"
+
+#### Detect System and dependencies ####
+readlink="readlink"
+du="du"
+wc="wc"
+wait_for_change="inotifywait . -r -e modify,move,create,delete --format %w%f --exclude \\.git -t $TIMEOUT"
+
+if [[ $SYSTEM = "Darwin" ]]; then
+    command -v gtimeout >/dev/null || { echo "Please install coreutils." >&2; exit 1; }
+    command -v fswatch >/dev/null || { echo "Please install fswatch." >&2; exit 1; }
+    readlink="greadlink"
+    du="gdu"
+    wc="gwc"
+    wait_for_change="gtimeout $TIMEOUT fswatch --recursive --event=414 --exclude \\.git  -1 ."
+fi
+
+usage () {
+    printf "Usage: $(basename $0) [-q1] [-s seconds] [DIR]
+
+Auto-sync a git repo.
+
+DIR is the git repository to sync.
+A branch should be checked out and an upstream configured
+for that branch. If DIR is not given, the current working
+directory is synced.
+
+Options:
+  -h: Show this help
+  -q: Don't show system notifications
+  -1: Run once, don't loop
+  -s: Specify the number of seconds to wait before commit when a change is detected.
+"
+    exit 0
+}
+
+while getopts "q1hs:" OPTION # Process command line options
+do
+    case "${OPTION}" in
+        q) QUIET="y";;    # No notifications
+        1) NO_LOOP="y";;  # Exit after 1 sync
+        s) SLEEP_BEFORE_COMMIT="$OPTARG";;
+        h) usage;;
+        *) exit 1 ;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+[[ $# -gt 1 ]] && { echo "Don't support multiple locations (yet)." >&2; exit 1; }
+
+# Use either $1 or "."
+TARGET="$($readlink -f "${1-.}")" || { echo "readlink failed?!" >&2; exit 1; }
+declare -r TARGET
+
+
+msg() {
+    # log message with date and target dir
+    printf "[%s %s] %s\n" "$TARGET" "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+
+warn() {
+    # log message and show it as a system notification
+    msg "$*"
+    [[ -n $QUIET ]] && return 0
+    if [[ $SYSTEM = Darwin ]]; then
+        osascript -e "display notification \"git-pisces on '$TARGET': $*\"" 2> /dev/null
+    else
+        notify-send "git-pisces on '$TARGET': $*" 2> /dev/null
+    fi
+}
+
+
+error() {
+    # Log an error and exit
+    # First argument: error code
+    # All others are logged
+    retval="$1"
+    shift
+    warn "Error: $*" >&2
+    exit "$retval"
+}
+
+
+######## Git Repo Operations ########
+
+get_git_dir() {
+    # Print the git repo directory (.git) or die
+    git rev-parse --git-dir || error $? "Not a git repo";
+}
+
+
+get_current_branch() {
+    # Return the current branch or die
+    local CURR
+    if CURR=$(git rev-parse --abbrev-ref HEAD); then
+        if [[ -n $CURR && $CURR != "HEAD" ]]; then
+            echo "$CURR"
+            return 0
+        else
+            # head checked out
+            # or empty branch name (should not be possible)
+            error 3 "No active branch."
+        fi
+     else
+        # Git returned error
+        error $? "Cannot get active branch."
+    fi
+}
+
+
+get_remote_branch() {
+    # Detect remote/branch or die
+    # Return nothing; instead set REMOTE and BRANCH variables
+    BRANCH=$(get_current_branch) || error $? get_current_branch
+    if REMOTE=$(git config --get "branch.$BRANCH.remote"); then
+
+        if [[ -n $REMOTE ]]; then
+            # Check remote branch actually exists
+            if git show-ref --quiet --verify -- "refs/remotes/$REMOTE/$BRANCH"; then
+                export REMOTE
+                export BRANCH
+                return 0
+            else
+                error 3 "No branch named '$BRANCH' on '$REMOTE'."
+            fi
+        else
+            error 3 "No remote configured for branch '$BRANCH'."
+        fi
+    else
+        # Git returned error
+        error $? "Cannot get remote for branch '$BRANCH'"
+    fi
+}
+
+
+repo_has_changes() {
+    git status --porcelain | grep -qE '^(\?\?|[MARC] |[ MARC][MD])*'
+}
+
+
+added_files() {
+    git status --porcelain | awk '$1 ~ "^A" { print $2 }'
+}
+
+
+check_add_file_limits() {
+    # Exits with an error if newly added files exceed limits
+    FILES=$(added_files)
+    if [[ -n $FILES ]]; then
+        NUM=$($wc -l <<< "$FILES")
+        if [[ $NUM -gt $MAX_NEW ]]; then
+            warn "Too many new files ($NUM)."
+        else
+            SIZE=$(xargs "$du" -cs <<< "$FILES" | tail -1 | cut -f1)
+            if [[ $SIZE -gt $MAX_NEW_SIZE ]]; then
+                warn "New files are too large (${SIZE}K)."
+            fi
+        fi
+    fi
+}
+
+
+check_local_state_valid () {
+    # Check if repo is in an unsupported state, e.g. rebasing
+    # If so, return 1
+    local GIT_DIR STATE
+    GIT_DIR=$(get_git_dir) || exit $?
+	if [[ -f "$GIT_DIR/rebase-merge/interactive" || -d "$GIT_DIR/rebase-merge" ]]; then
+		STATE="rebase"
+	else
+		if [[ -d "$GIT_DIR/rebase-apply" ]]; then
+			STATE="rebase"
+		elif [[ -f "$GIT_DIR/MERGE_HEAD" ]]; then
+			STATE="merging"
+		elif [[ -f "$GIT_DIR/CHERRY_PICK_HEAD" ]]; then
+			STATE="cherry-picking"
+		elif [[ -f "$GIT_DIR/BISECT_LOG" ]]; then
+			STATE="bisecting"
+		fi
+	fi
+    if [[ -n $STATE ]]; then
+        warn "Cannot sync because target in an unsupported state ($STATE)."
+        return 1
+    fi
+}
+
+# We keep track of currently occurring sync issues
+# So we don't bother the user with an endless stream of notifications
+SYNC_PROBLEMS=""
+
+sync_problems(){
+    if [[ -n $SYNC_PROBLEMS ]]; then
+        # User has had notification; just log
+        msg "$1 still failing."
+    else
+        # New problem; warn
+        warn "$1 failed, possibly a networking issue."
+        SYNC_PROBLEMS="t"
+    fi
+}
+
+
+fetch() {
+    get_remote_branch || exit $?
+    if git fetch "$REMOTE" "$BRANCH" 2>/dev/null; then
+        [[ -n $SYNC_PROBLEMS ]] && msg "Success!"
+        SYNC_PROBLEMS=""
+    else
+        sync_problems "Fetch"
+    fi
+}
+
+
+push() {
+    msg "Pushing changes..."
+    if git push "$REMOTE" "$BRANCH:$BRANCH" 2>/dev/null; then
+        [[ -n $SYNC_PROBLEMS ]] && msg "Success!"
+        SYNC_PROBLEMS=""
+    else
+        sync_problems "Push"
+    fi
+}
+
+
+merge() {
+    msg "Trying fast-forward..."
+    git merge --ff --ff-only "$REMOTE/$BRANCH" || warn "Error during merge, probably a conflict. Please fix."
+}
+
+
+rebase() {
+    msg "We have diverged. Trying to rebase..."
+	git rebase "$REMOTE/$BRANCH" || warn "Error during rebase, probably a conflict. Please fix."
+    # We need to check state after rebase
+    check_local_state_valid
+    if repo_has_changes; then
+        warn "Rebasing failed - possible conflicts. Please fix."
+    fi
+    STATE=$(sync_state) || exit $?
+    if [[ $STATE = "ahead" ]]; then
+        push
+    else
+        warn "Unexpected state after rebase. Please fix."
+    fi
+}
+
+
+sync_state () {
+    # determine sync state of repository, i.e. how the remote relates to our HEAD
+    # This assumes we have already done a fetch
+    local COUNT
+    if COUNT="$(git rev-list --count --left-right "$REMOTE/$BRANCH"...HEAD)"; then
+        case "$COUNT" in
+	        "") # no upstream.. is this possible? get_remote_branch would fail
+	            error 3 "branch '$BRANCH' has no upstream"
+	            ;;
+	        "0	0")
+	            echo "equal"
+	            ;;
+	        "0	"*)
+	            echo "ahead"
+	            ;;
+	        *"	0")
+	            echo "behind"
+	            ;;
+	        *)
+	            echo "diverged"
+	            ;;
+        esac
+    else
+        warn "Could not retrieve sync state"
+    fi
+}
+
+###### Committing ######
+
+make_commit_msg() {
+    FILES="$(git status --porcelain)" || error 3 "Cannot get git status."
+    NUM=$($wc -l <<< "$FILES")
+    if [[ $NUM = 1 ]]; then
+        printf "$FILES"
+    else
+        printf "Files changed: %s\n\n%s" "${NUM}" "$FILES"
+    fi
+}
+
+
+commit_local_changes() {
+    if repo_has_changes; then
+        sleep "$SLEEP_BEFORE_COMMIT"
+        if repo_has_changes; then
+            msg "Committing..."
+            git add -A || warn "Cannot add all changes to commit."
+            check_add_file_limits
+
+            git commit -m "$(make_commit_msg)" >/dev/null || warn "Cannot commit changes."
+        fi
+    fi
+}
+
+
+#### Actual syncing ####
+do_sync() {
+    check_local_state_valid || return
+
+    commit_local_changes
+    fetch
+
+    STATE=$(sync_state) || exit $?
+    case "$STATE" in
+        "equal")
+            return
+	        ;;
+        "ahead")
+            push
+	        ;;
+        "behind")
+            merge
+	        ;;
+        "diverged")
+            rebase
+            ;;
+    esac
+    STATE=$(sync_state) || exit $?
+    if [[ $STATE != "equal" ]]; then
+        warn "Local and remote still differ after sync. Please check."
+    fi
+}
+
+
+#### Preliminary checks ####
+
+check_target() {
+    # Do some basic checks before starting
+    [[ -d $TARGET ]] || error 2 "Target '$TARGET' is not a directory."
+
+    cd "$TARGET" || error 2 "Cannot move into target dir '$TARGET'"
+
+    if [[ "true" = "$(git rev-parse --is-inside-git-dir 2>/dev/null)" ]]; then
+        if [[ "true" = "$(git rev-parse --is-bare-repository 2>/dev/null)" ]]; then
+            error 3 "Cannot sync because target is a bare repo."
+        fi
+        error 3 "Cannot sync because target is a .git dir."
+    fi
+
+    export TARGET
+}
+
+####### Main ########
+
+check_target >/dev/null
+
+msg "Starting sync for $TARGET"
+
+while true; do
+    do_sync
+    [[ -n $NO_LOOP ]] && exit 0
+	CHANGE=$($wait_for_change 2>/dev/null)
+    [[ -n $CHANGE ]] && msg "Changes detected: $CHANGE"
+done
