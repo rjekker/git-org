@@ -98,7 +98,6 @@ error() {
 
 
 ######## Git Repo Operations ########
-
 get_git_dir() {
     # Print the git repo directory (.git) or die
     git rev-parse --git-dir || error $? "Not a git repo";
@@ -228,6 +227,7 @@ fetch() {
 
 
 push() {
+    get_remote_branch || exit $?
     msg "Pushing changes..."
     if git push "$REMOTE" "$BRANCH:$BRANCH" 2>/dev/null; then
         [[ -n $SYNC_PROBLEMS ]] && msg "Success!"
@@ -239,12 +239,14 @@ push() {
 
 
 merge() {
+    get_remote_branch || exit $?
     msg "Trying fast-forward..."
     git merge --ff --ff-only "$REMOTE/$BRANCH" || warn "Error during merge, probably a conflict. Please fix."
 }
 
 
 rebase() {
+    get_remote_branch || exit $?
     msg "We have diverged. Trying to rebase..."
 	git rebase "$REMOTE/$BRANCH" || warn "Error during rebase, probably a conflict. Please fix."
     # We need to check state after rebase
