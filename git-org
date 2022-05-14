@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 
-# Git Pisces
 # Automatically sync a git repo.
 # For info see https://github.com/rjekker/git-org
 
@@ -80,9 +79,9 @@ warn() {
     msg "$*"
     [[ -n $QUIET ]] && return 0
     if [[ $SYSTEM = Darwin ]]; then
-        osascript -e "display notification \"git-pisces on '$TARGET': $*\"" 2> /dev/null
+        osascript -e "display notification \"$0 on '$TARGET': $*\"" 2> /dev/null
     else
-        notify-send "git-pisces on '$TARGET': $*" 2> /dev/null
+        notify-send "$0 on '$TARGET': $*" 2> /dev/null
     fi
 }
 

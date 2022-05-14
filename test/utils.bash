@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-export test_cmd="git-pisces -q1s 0"
+export test_cmd="git-org -q1s 0"
 
 mktempdir() {
     mktemp="mktemp"

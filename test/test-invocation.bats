@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 # -*- shell-script -*-
-# Unit tests for git-pisces
+# Unit tests for git-org
 # Depends on the bats-core testing framework: https://github.com/bats-core
 # (Note: don't accidentally install the old 'bats'; use 'bats-core')
 # On Mac OS we also assume that coreutils has been installed
